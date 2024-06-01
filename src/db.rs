@@ -10,7 +10,7 @@ pub struct Db {
 }
 
 impl Db {
-    fn new(db_path: PathBuf, max_file_size: usize) -> Result<Self, Error> {
+    pub fn new(db_path: PathBuf, max_file_size: usize) -> Result<Self, Error> {
         let mut chunks = Chunks::new(db_path, max_file_size)?;
         let index_map = chunks.recreate_index_from_old_chunks()?;
         let index = Index::new(index_map);
@@ -39,7 +39,7 @@ impl Db {
     }
 
     pub fn merge() {
-        println!("merging");
+        todo!();
     }
 }
 

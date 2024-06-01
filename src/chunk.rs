@@ -103,11 +103,10 @@ impl Chunk {
         let file_len = mmap.len();
         let mut cursor = 0;
         while cursor < file_len {
-            let _checksum = self.read_u32(&mmap, cursor)?; // 4 bytes
-            let timestamp = self.read_u64(&mmap, cursor + 4)?; // 8 bytes
-            let key_size = self.read_u32(&mmap, cursor + 12)?; // 4 bytes
-            let value_size = self.read_u32(&mmap, cursor + 16)?; // 4 bytes
-            cursor += 20;
+            let timestamp = self.read_u64(&mmap, cursor)?; // 8 bytes
+            let key_size = self.read_u32(&mmap, cursor + 8)?; // 4 bytes
+            let value_size = self.read_u32(&mmap, cursor + 12)?; // 4 bytes
+            cursor += 16;
 
             let key = self.read_vec_u8(&mmap, cursor, key_size as usize)?;
             cursor += key_size as usize;
@@ -153,13 +152,7 @@ impl Chunk {
         record.extend_from_slice(&value_size.to_be_bytes().to_vec());
         record.extend_from_slice(&key);
         record.extend_from_slice(&value);
-
-        let checksum = crc32fast::hash(&record);
-
-        let mut record_with_crc: Vec<u8> = Vec::new();
-        record_with_crc.extend_from_slice(&checksum.to_be_bytes().to_vec());
-        record_with_crc.extend_from_slice(&record);
-        record_with_crc
+        record
     }
 }
 
@@ -226,14 +219,8 @@ mod tests {
         record.extend_from_slice(&key);
         record.extend_from_slice(&value);
 
-        let checksum = crc32fast::hash(&record);
-
-        let mut expected_content: Vec<u8> = Vec::new();
-        expected_content.extend_from_slice(&checksum.to_be_bytes().to_vec());
-        expected_content.extend_from_slice(&record);
-
         // Assert that the file contents match the expected contents
-        assert_eq!(file_contents, expected_content);
+        assert_eq!(file_contents, record);
     }
 
     #[test]
@@ -267,14 +254,8 @@ mod tests {
         record.extend_from_slice(&key);
         record.extend_from_slice(&value);
 
-        let checksum = crc32fast::hash(&record);
-
-        let mut expected_content: Vec<u8> = Vec::new();
-        expected_content.extend_from_slice(&checksum.to_be_bytes().to_vec());
-        expected_content.extend_from_slice(&record);
-
         // Assert that the file contents match the expected contents
-        assert_eq!(file_contents, expected_content);
+        assert_eq!(file_contents, record);
     }
 
     #[test]
