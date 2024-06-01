@@ -88,14 +88,19 @@ mod tests {
     }
 
     #[test]
-    fn should_contain_added_element() {
+    fn test_should_contain_added_element() {
+        // Given
         let db_path = get_unique_db_path();
         let mut db = Db::new(db_path, ONE_KB_IN_BYTES).unwrap();
 
         let key = b"key".to_vec();
-        let _ = db.put(&key, &b"value".to_vec());
+        let value = b"value".to_vec();
+
+        // When
+        let _ = db.put(&key, &value);
         let result = db.get(&key).unwrap();
 
+        // Then
         match result {
             Some(name) => assert_eq!(name, b"value".to_vec()),
             None => panic!("Expected \"value\" but got None"),
@@ -103,24 +108,79 @@ mod tests {
     }
 
     #[test]
-    fn should_not_contain_removed_element() {
+    fn test_should_not_contain_removed_element() {
+        // Given
         let db_path = get_unique_db_path();
         let mut db = Db::new(db_path, ONE_KB_IN_BYTES).unwrap();
 
         let key = b"key".to_vec();
-        let _ = db.put(&key, &b"value".to_vec());
+        let value = b"value".to_vec();
+
+        // When
+        let _ = db.put(&key, &value);
         let _ = db.delete(&key);
         let result = db.get(&key).unwrap();
+
+        // Then
         assert_eq!(result, None);
     }
 
     #[test]
-    fn should_return_null_if_key_do_not_exists() {
+    fn test_return_null_if_key_do_not_exists() {
+        // Given
         let db_path = get_unique_db_path();
         let mut db = Db::new(db_path, ONE_KB_IN_BYTES).unwrap();
 
         let key = b"key".to_vec();
+
+        // When
         let result = db.get(&key).unwrap();
+
+        // Then
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_should_recreate_db_from_existing_files() {
+        // Given
+        let db_path = get_unique_db_path();
+        let mut db_original = Db::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+
+        let key_1 = b"key_1".to_vec();
+        let value_1 = b"value_1".to_vec();
+
+        let key_2_deleted = b"key_2_deleted".to_vec();
+        let value_2_deleted = b"value_2_deleted".to_vec();
+
+        let key_3_overriden = b"key_3_overriden".to_vec();
+        let value_3_old = b"value_3_old".to_vec();
+        let value_3_new = b"value_3_new".to_vec();
+
+        let large_key_1 = b"large_key_1".to_vec();
+        let large_key_2 = b"large_key_2".to_vec();
+        let large_value = vec![b'a'; 1024];
+
+        // Database initialization
+        let _ = db_original.put(&key_1, &value_1);
+        let _ = db_original.put(&key_2_deleted, &value_2_deleted);
+        let _ = db_original.put(&key_3_overriden, &value_3_old);
+        let _ = db_original.put(&large_key_1, &large_value);
+
+        let _ = db_original.delete(&key_2_deleted);
+        let _ = db_original.put(&key_3_overriden, &value_3_new);
+        let _ = db_original.put(&large_key_2, &large_value);
+
+        // Create new db instance
+        let mut db_recreated = Db::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+
+        // Query data
+        let result_1_regular = db_recreated.get(&key_1).unwrap();
+        let result_2_deleted = db_recreated.get(&key_2_deleted).unwrap();
+        let result_3_overriden = db_recreated.get(&key_3_overriden).unwrap();
+
+        // Verify if data is recreated correctly
+        assert_eq!(result_1_regular.unwrap(), value_1);
+        assert_eq!(result_2_deleted.is_none(), true);
+        assert_eq!(result_3_overriden.unwrap(), value_3_new);
     }
 }
