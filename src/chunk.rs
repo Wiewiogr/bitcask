@@ -92,7 +92,6 @@ impl Chunk {
             self.prepare_record_bytes(key, &Chunk::TOMBSTONE_VALUE, Chunk::TOMBSTONE_TIMESTAMP);
 
         self.file.write(&record_bytes)?;
-        self.file.flush()?;
         Ok(())
     }
 
@@ -247,7 +246,7 @@ mod tests {
         let key = b"example_key".to_vec();
 
         // Use delete method
-        chunk.delete(&key);
+        let _ = chunk.delete(&key);
 
         // Open the file to read its contents
         let file_path = SETUP.join(format!("{}.data", file_id));
@@ -336,7 +335,7 @@ mod tests {
         let key = b"example_key".to_vec();
         let value = vec![b'a'; 1024]; // Vector of 1024 'a's
         let timestamp: u64 = 1620867414000;
-        chunk.put(&key, &value, timestamp);
+        let _ = chunk.put(&key, &value, timestamp);
 
         // When
         let is_full = chunk.is_full();

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Error;
 use std::path::PathBuf;
@@ -9,7 +9,7 @@ use super::db::ValueDetails;
 
 pub struct Chunks {
     current_chunk: Chunk,
-    old_chunks: HashMap<u32, Chunk>,
+    old_chunks: BTreeMap<u32, Chunk>,
     current_file_id: u32,
     data_directory: PathBuf,
     max_file_size: usize,
@@ -20,7 +20,7 @@ impl Chunks {
         fs::create_dir_all(db_path.clone())?;
 
         let mut current_file_id = 0;
-        let mut old_chunks = HashMap::new();
+        let mut old_chunks = BTreeMap::new();
 
         let entries = fs::read_dir(&db_path).unwrap();
         for entry in entries {
@@ -96,7 +96,9 @@ impl Chunks {
         Ok(())
     }
 
-    pub fn recreate_index_from_old_chunks(&mut self) -> Result<HashMap<Vec<u8>, ValueDetails>, Error> {
+    pub fn recreate_index_from_old_chunks(
+        &mut self,
+    ) -> Result<HashMap<Vec<u8>, ValueDetails>, Error> {
         let mut index: HashMap<Vec<u8>, ValueDetails> = HashMap::new();
         for (_, chunk) in self.old_chunks.iter_mut() {
             chunk.recreate_index(&mut index)?;
@@ -481,9 +483,16 @@ mod tests {
         let key_current_file = b"key_3".to_vec();
         let value_current_file = b"example_value".to_vec();
 
+        println!("write 1");
         let value_details_1 = chunks.put(&key, &large_value_1).unwrap();
+        println!("write 2");
         let value_details_2 = chunks.put(&key, &large_value_2).unwrap();
+        println!("write 3");
         let value_details_3 = chunks.put(&key_current_file, &value_current_file).unwrap();
+
+        println!("value_detail_1 : {:?}", value_details_1);
+        println!("value_detail_2 : {:?}", value_details_2);
+        println!("value_detail_3 : {:?}", value_details_3);
 
         // Verify that keys are placed in different files
         assert!(value_details_1.file_id < value_details_2.file_id);
@@ -492,6 +501,7 @@ mod tests {
         // When
         let result = chunks.recreate_index_from_old_chunks().unwrap();
 
+        println!("{:?}", result);
         // Then
         assert_eq!(result.len(), 1);
 
@@ -518,7 +528,7 @@ mod tests {
         // first file
         chunks.put(&key, &value).unwrap();
         chunks.put(&key_1, &large_value_1).unwrap();
-        
+
         // second file
         chunks.delete(&key).unwrap();
         chunks.put(&key_2, &large_value_2).unwrap();
@@ -533,6 +543,5 @@ mod tests {
         assert_eq!(result.contains_key(&key), false);
     }
 }
-
 
 // creates correct index for value deleted in the second file
