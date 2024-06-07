@@ -18,13 +18,13 @@ impl Db {
         Ok(Db { chunks, index })
     }
 
-    pub fn put(&mut self, key: &Vec<u8>, value: &Vec<u8>) -> Result<(), Error> {
+    pub fn put(&self, key: &Vec<u8>, value: &Vec<u8>) -> Result<(), Error> {
         let value_details = self.chunks.put(key, value)?;
         self.index.put(key.clone(), value_details);
         Ok(())
     }
 
-    pub fn get(&mut self, key: &Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
+    pub fn get(&self, key: &Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
         let value_details = self.index.get(key);
         match value_details {
             Some(details) => Ok(Some(self.chunks.get(&details)?)),
@@ -43,7 +43,7 @@ impl Db {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct ValueDetails {
     pub file_id: u32,
     pub value_size: u32,

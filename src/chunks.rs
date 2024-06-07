@@ -1,16 +1,18 @@
+use std::cell::{RefCell, RefMut};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Error;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::chunk::Chunk;
 use super::db::ValueDetails;
 
 pub struct Chunks {
-    current_chunk: Chunk,
-    old_chunks: BTreeMap<u32, Chunk>,
-    current_file_id: u32,
+    chunks: RefCell<BTreeMap<u32, Chunk>>,
+    current_file_id: Arc<AtomicU32>,
     data_directory: PathBuf,
     max_file_size: usize,
 }
@@ -20,7 +22,7 @@ impl Chunks {
         fs::create_dir_all(db_path.clone())?;
 
         let mut current_file_id = 0;
-        let mut old_chunks = BTreeMap::new();
+        let mut chunks = BTreeMap::new();
 
         let entries = fs::read_dir(&db_path).unwrap();
         for entry in entries {
@@ -41,7 +43,7 @@ impl Chunks {
                     let file_index = file_index_str.parse::<u32>().unwrap();
 
                     current_file_id = Ord::max(current_file_id, file_index);
-                    old_chunks.insert(
+                    chunks.insert(
                         file_index,
                         Chunk::from_existing(&path, file_index, max_file_size)?,
                     );
@@ -53,46 +55,54 @@ impl Chunks {
             }
         }
 
-        current_file_id = if old_chunks.len() == 0 {
+        current_file_id = if chunks.len() == 0 {
             0
         } else {
             current_file_id + 1
         };
 
-        Ok(Chunks {
-            current_chunk: Chunk::new(&db_path, current_file_id, max_file_size)?,
-            old_chunks,
+        chunks.insert(
             current_file_id,
+            Chunk::new(&db_path, current_file_id, max_file_size)?,
+        );
+        Ok(Chunks {
+            chunks: RefCell::new(chunks),
+            current_file_id: Arc::new(AtomicU32::new(current_file_id)),
             data_directory: db_path.clone(),
             max_file_size,
         })
     }
 
-    pub fn put(&mut self, key: &Vec<u8>, value: &Vec<u8>) -> Result<ValueDetails, Error> {
-        if self.current_chunk.is_full() {
-            self.deprecate_current_chunk()?;
+    pub fn put(&self, key: &Vec<u8>, value: &Vec<u8>) -> Result<ValueDetails, Error> {
+        let mut chunks = self.chunks.borrow_mut();
+        let mut current_chunk = chunks.last_key_value().unwrap().1;
+
+        if current_chunk.is_full() {
+            self.deprecate_current_chunk(&mut chunks)?;
+            current_chunk = chunks.last_key_value().unwrap().1;
         }
 
         let timestamp = self.current_timestamp();
-        return self.current_chunk.put(key, value, timestamp);
+        return current_chunk.put(key, value, timestamp);
     }
 
-    pub fn get(&mut self, value_details: &ValueDetails) -> Result<Vec<u8>, Error> {
+    pub fn get(&self, value_details: &ValueDetails) -> Result<Vec<u8>, Error> {
         let file_id = value_details.file_id;
-        if file_id == self.current_file_id {
-            return self.current_chunk.get(value_details);
-        }
-
-        let chunk = self.old_chunks.get_mut(&file_id).unwrap();
+        let chunks = self.chunks.borrow();
+        let chunk = chunks.get(&file_id).unwrap();
         return chunk.get(value_details);
     }
 
-    pub fn delete(&mut self, key: &Vec<u8>) -> Result<(), Error> {
-        if self.current_chunk.is_full() {
-            self.deprecate_current_chunk()?;
+    pub fn delete(&self, key: &Vec<u8>) -> Result<(), Error> {
+        let mut chunks = self.chunks.borrow_mut();
+        let mut current_chunk = chunks.last_key_value().unwrap().1;
+
+        if current_chunk.is_full() {
+            self.deprecate_current_chunk(&mut chunks)?;
+            current_chunk = chunks.last_key_value().unwrap().1;
         }
 
-        self.current_chunk.delete(key)?;
+        current_chunk.delete(key)?;
         Ok(())
     }
 
@@ -100,26 +110,21 @@ impl Chunks {
         &mut self,
     ) -> Result<HashMap<Vec<u8>, ValueDetails>, Error> {
         let mut index: HashMap<Vec<u8>, ValueDetails> = HashMap::new();
-        for (_, chunk) in self.old_chunks.iter_mut() {
+        for (_, chunk) in self.chunks.borrow_mut().iter_mut() {
             chunk.recreate_index(&mut index)?;
         }
         Ok(index)
     }
 
-    fn deprecate_current_chunk(&mut self) -> Result<(), Error> {
-        let old_file_id = self.current_file_id;
-        self.current_file_id += 1;
-        let new_chunk = Chunk::new(
-            &self.data_directory,
-            self.current_file_id,
-            self.max_file_size,
-        )?;
-        let old_chunk = std::mem::replace(&mut self.current_chunk, new_chunk);
-        self.old_chunks.insert(old_file_id, old_chunk);
+    fn deprecate_current_chunk(&self, chunks: &mut RefMut<'_, BTreeMap<u32, Chunk>>) -> Result<(), Error> {
+        let previous_file_id = self.current_file_id.fetch_add(1, Ordering::SeqCst);
+        let new_file_id = previous_file_id + 1;
+        let new_chunk = Chunk::new(&self.data_directory, new_file_id, self.max_file_size)?;
+        chunks.insert(new_file_id, new_chunk);
         Ok(())
     }
 
-    fn current_timestamp(&mut self) -> u64 {
+    fn current_timestamp(&self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -175,7 +180,7 @@ mod tests {
     fn test_put_value_to_the_current_chunk() {
         // Given
         let db_path = get_unique_db_path();
-        let mut chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+        let chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
 
         let key = b"example_key".to_vec();
         let value = b"example_value".to_vec();
@@ -192,7 +197,7 @@ mod tests {
     fn test_put_more_than_one_value_in_the_current_chunk() {
         // Given
         let db_path = get_unique_db_path();
-        let mut chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+        let chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
 
         let key1 = b"example_key_1".to_vec();
         let value1 = b"example_value_1".to_vec();
@@ -212,7 +217,7 @@ mod tests {
     fn test_put_value_to_the_new_chunk_if_current_is_full() {
         // Given
         let db_path = get_unique_db_path();
-        let mut chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+        let chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
 
         let large_key = b"example_key_large".to_vec();
         let large_value = vec![b'a'; 1024];
@@ -233,7 +238,7 @@ mod tests {
     fn test_put_should_create_more_chunks_as_next_ones_are_becoming_full() {
         // Given
         let db_path = get_unique_db_path();
-        let mut chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+        let chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
 
         let key_1 = b"example_key_1".to_vec();
         let key_2 = b"example_key_2".to_vec();
@@ -255,7 +260,7 @@ mod tests {
     fn test_delete_value_from_the_current_chunk() {
         // Given
         let db_path = get_unique_db_path();
-        let mut chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+        let chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
 
         let key = b"example_key".to_vec();
 
@@ -270,7 +275,7 @@ mod tests {
     fn test_delete_more_than_one_value_in_the_current_chunk() {
         // Given
         let db_path = get_unique_db_path();
-        let mut chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+        let chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
 
         let key1 = b"example_key_1".to_vec();
         let key2 = b"example_key_2".to_vec();
@@ -287,7 +292,7 @@ mod tests {
     fn test_delete_value_in_the_new_chunk_if_current_is_full() {
         // Given
         let db_path = get_unique_db_path();
-        let mut chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+        let chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
 
         let large_key = b"example_key_large".to_vec();
         let large_value = vec![b'a'; 1024];
@@ -306,7 +311,7 @@ mod tests {
     fn test_get_value_from_the_current_chunk() {
         // Given
         let db_path = get_unique_db_path();
-        let mut chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+        let chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
 
         let key = b"example_key".to_vec();
         let value = b"example_value".to_vec();
@@ -323,7 +328,7 @@ mod tests {
     fn test_get_value_from_the_old_chunk() {
         // Given
         let db_path = get_unique_db_path();
-        let mut chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+        let chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
 
         // Records we are looking for
         let key = b"example_key".to_vec();
@@ -352,7 +357,7 @@ mod tests {
     fn test_open_alread_existing_files() {
         // Given
         let db_path = get_unique_db_path();
-        let mut previous_chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+        let previous_chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
 
         // populate
         let key = b"example_key".to_vec();
@@ -370,7 +375,7 @@ mod tests {
     fn test_read_value_from_existing_files() {
         // Given
         let db_path = get_unique_db_path();
-        let mut previous_chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+        let previous_chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
 
         // populate
         let key = b"example_key".to_vec();
@@ -378,7 +383,7 @@ mod tests {
         let value_details = previous_chunks.put(&key, &value).unwrap();
 
         // When
-        let mut new_chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+        let new_chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
         let result = new_chunks.get(&value_details).unwrap();
 
         // Then
@@ -389,7 +394,7 @@ mod tests {
     fn test_put_to_the_new_current_file_when_opened_from_existing_files() {
         // Given
         let db_path = get_unique_db_path();
-        let mut previous_chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+        let previous_chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
 
         // populate
         let key = b"example_key".to_vec();
@@ -400,7 +405,7 @@ mod tests {
         let new_value = b"new_value".to_vec();
 
         // When
-        let mut new_chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
+        let new_chunks = Chunks::new(db_path.clone(), ONE_KB_IN_BYTES).unwrap();
         let new_value_details = new_chunks.put(&new_key, &new_value).unwrap();
 
         // Then
@@ -431,10 +436,13 @@ mod tests {
         let result = chunks.recreate_index_from_old_chunks().unwrap();
 
         // Then
-        assert_eq!(result.len(), 1);
+        assert_eq!(result.len(), 2);
 
         assert_eq!(result.contains_key(&key_1), true);
         assert_eq!(*result.get(&key_1).unwrap(), value_details_1);
+
+        assert_eq!(result.contains_key(&key_2), true);
+        assert_eq!(*result.get(&key_2).unwrap(), value_details_2);
     }
 
     #[test]
@@ -462,13 +470,16 @@ mod tests {
         let result = chunks.recreate_index_from_old_chunks().unwrap();
 
         // Then
-        assert_eq!(result.len(), 2);
+        assert_eq!(result.len(), 3);
 
         assert_eq!(result.contains_key(&key_1), true);
         assert_eq!(*result.get(&key_1).unwrap(), value_details_1);
 
         assert_eq!(result.contains_key(&key_2), true);
         assert_eq!(*result.get(&key_2).unwrap(), value_details_2);
+
+        assert_eq!(result.contains_key(&key_3_current_file), true);
+        assert_eq!(*result.get(&key_3_current_file).unwrap(), value_details_3);
     }
 
     #[test]
@@ -483,16 +494,9 @@ mod tests {
         let key_current_file = b"key_3".to_vec();
         let value_current_file = b"example_value".to_vec();
 
-        println!("write 1");
         let value_details_1 = chunks.put(&key, &large_value_1).unwrap();
-        println!("write 2");
         let value_details_2 = chunks.put(&key, &large_value_2).unwrap();
-        println!("write 3");
         let value_details_3 = chunks.put(&key_current_file, &value_current_file).unwrap();
-
-        println!("value_detail_1 : {:?}", value_details_1);
-        println!("value_detail_2 : {:?}", value_details_2);
-        println!("value_detail_3 : {:?}", value_details_3);
 
         // Verify that keys are placed in different files
         assert!(value_details_1.file_id < value_details_2.file_id);
@@ -501,12 +505,14 @@ mod tests {
         // When
         let result = chunks.recreate_index_from_old_chunks().unwrap();
 
-        println!("{:?}", result);
         // Then
-        assert_eq!(result.len(), 1);
+        assert_eq!(result.len(), 2);
 
         assert_eq!(result.contains_key(&key), true);
         assert_eq!(*result.get(&key).unwrap(), value_details_2);
+
+        assert_eq!(result.contains_key(&key_current_file), true);
+        assert_eq!(*result.get(&key_current_file).unwrap(), value_details_3);
     }
 
     #[test]

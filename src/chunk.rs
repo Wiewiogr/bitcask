@@ -1,8 +1,10 @@
 use std::{
     collections::HashMap,
     fs::File,
-    io::{Error, Read, Seek, SeekFrom, Write},
+    io::Error,
+    os::unix::prelude::FileExt,
     path::PathBuf,
+    sync::{atomic::{Ordering, AtomicU64}, Arc},
 };
 
 use memmap2::Mmap;
@@ -13,7 +15,8 @@ pub struct Chunk {
     file: File,
     file_id: u32,
     max_file_size: usize,
-    current_size: usize,
+    pointer: Arc<AtomicU64>,
+    immutable: bool
 }
 
 impl Chunk {
@@ -33,7 +36,8 @@ impl Chunk {
             file,
             file_id,
             max_file_size,
-            current_size: 0,
+            pointer: Arc::new(AtomicU64::new(0)),
+            immutable: true,
         })
     }
 
@@ -47,29 +51,31 @@ impl Chunk {
             file,
             file_id,
             max_file_size,
-            current_size: 0,
+            pointer: Arc::new(AtomicU64::new(0)),
+            immutable: false
         })
     }
 
-    pub fn is_full(&mut self) -> bool {
-        self.current_size >= self.max_file_size
+    pub fn is_full(&self) -> bool {
+        self.immutable || self.pointer.load(Ordering::SeqCst) as usize >= self.max_file_size
     }
 
     pub fn put(
-        &mut self,
+        &self,
         key: &Vec<u8>,
         value: &Vec<u8>,
         timestamp: u64,
     ) -> Result<ValueDetails, Error> {
         let value_size = value.len() as u32;
+        let current_position = self.pointer.load(Ordering::SeqCst);
 
         let record_bytes = self.prepare_record_bytes(key, value, timestamp);
+        self.file.write_at(record_bytes.as_slice(), self.pointer.load(Ordering::SeqCst))?;
 
-        self.file.write(&record_bytes)?;
-
-        let current_position = self.file.stream_position().unwrap();
-        self.current_size = current_position as usize;
+        let current_position = current_position + record_bytes.len() as u64;
         let value_pos = current_position as u32 - value_size;
+
+        self.pointer.store(current_position, Ordering::SeqCst);
 
         Ok(ValueDetails {
             file_id: self.file_id,
@@ -79,19 +85,22 @@ impl Chunk {
         })
     }
 
-    pub fn get(&mut self, value_details: &ValueDetails) -> Result<Vec<u8>, Error> {
+    pub fn get(&self, value_details: &ValueDetails) -> Result<Vec<u8>, Error> {
         let mut value: Vec<u8> = vec![0; value_details.value_size as usize];
-        self.file
-            .seek(SeekFrom::Start(value_details.value_pos as u64))?;
-        self.file.read_exact(&mut value)?;
+        self.file.read_at(value.as_mut_slice(), value_details.value_pos as u64)?;
         Ok(value)
     }
 
-    pub fn delete(&mut self, key: &Vec<u8>) -> Result<(), Error> {
+    pub fn delete(&self, key: &Vec<u8>) -> Result<(), Error> {
+        let current_position = self.pointer.load(Ordering::SeqCst);
+
         let record_bytes =
             self.prepare_record_bytes(key, &Chunk::TOMBSTONE_VALUE, Chunk::TOMBSTONE_TIMESTAMP);
+        self.file.write_at(record_bytes.as_slice(), self.pointer.load(Ordering::SeqCst))?;
 
-        self.file.write(&record_bytes)?;
+        let current_position = current_position + record_bytes.len() as u64;
+        self.pointer.store(current_position, Ordering::SeqCst);
+
         Ok(())
     }
 
@@ -142,7 +151,7 @@ impl Chunk {
         Ok(bytes.to_vec())
     }
 
-    fn prepare_record_bytes(&mut self, key: &Vec<u8>, value: &Vec<u8>, timestamp: u64) -> Vec<u8> {
+    fn prepare_record_bytes(&self, key: &Vec<u8>, value: &Vec<u8>, timestamp: u64) -> Vec<u8> {
         let key_size = key.len() as u32;
         let value_size = value.len() as u32;
 
@@ -191,7 +200,7 @@ mod tests {
     fn test_put() {
         // Create a new chunk
         let file_id = get_unique_file_id();
-        let mut chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
+        let chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
 
         // Define key, value and timestamp
         let key = b"example_key".to_vec();
@@ -227,7 +236,7 @@ mod tests {
     fn test_delete() {
         // Create a new chunk
         let file_id = get_unique_file_id();
-        let mut chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
+        let chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
 
         // Define key, value and timestamp
         let key = b"example_key".to_vec();
@@ -262,7 +271,7 @@ mod tests {
     fn test_get_after_put() {
         // Given
         let file_id = get_unique_file_id();
-        let mut chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
+        let chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
 
         let key = b"example_key".to_vec();
         let value = b"example_value".to_vec();
@@ -280,7 +289,7 @@ mod tests {
     fn test_empty_file_is_not_empty() {
         // Given
         let file_id = get_unique_file_id();
-        let mut chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
+        let chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
 
         // When
         let is_full = chunk.is_full();
@@ -293,7 +302,7 @@ mod tests {
     fn test_is_not_full_if_there_is_still_place() {
         // Given
         let file_id = get_unique_file_id();
-        let mut chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
+        let chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
 
         let key = b"example_key".to_vec();
         let value = b"example_value".to_vec();
@@ -311,7 +320,7 @@ mod tests {
     fn test_chunk_is_full_if_it_is_past_the_max_size() {
         // Given
         let file_id = get_unique_file_id();
-        let mut chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
+        let chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
 
         let key = b"example_key".to_vec();
         let value = vec![b'a'; 1024]; // Vector of 1024 'a's
@@ -329,7 +338,7 @@ mod tests {
     fn test_correctly_opens_existing_file() {
         // Given
         let file_id = get_unique_file_id();
-        let mut chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
+        let chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
 
         let key = b"example_key".to_vec();
         let value = b"example_value".to_vec();
@@ -339,7 +348,7 @@ mod tests {
         let value_details = chunk.put(&key, &value, timestamp).unwrap();
 
         // When
-        let mut existing_chunk = Chunk::from_existing(
+        let existing_chunk = Chunk::from_existing(
             &SETUP.join(format!("{}.data", file_id)),
             file_id,
             ONE_KB_IN_BYTES,
@@ -355,7 +364,7 @@ mod tests {
     fn test_should_not_be_able_to_write_to_the_existing_file() {
         // Given
         let file_id = get_unique_file_id();
-        let mut chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
+        let chunk = Chunk::new(&SETUP, file_id, ONE_KB_IN_BYTES).unwrap();
 
         let key = b"example_key".to_vec();
         let value = b"example_value".to_vec();
@@ -369,7 +378,7 @@ mod tests {
         let new_timestamp: u64 = 1620868614000;
 
         // When
-        let mut existing_chunk = Chunk::from_existing(
+        let existing_chunk: Chunk = Chunk::from_existing(
             &SETUP.join(format!("{}.data", file_id)),
             file_id,
             ONE_KB_IN_BYTES,
