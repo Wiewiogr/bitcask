@@ -1,17 +1,16 @@
-use std::cell::{RefCell, RefMut};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Error;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::chunk::Chunk;
 use super::db::ValueDetails;
 
 pub struct Chunks {
-    chunks: RefCell<BTreeMap<u32, Chunk>>,
+    chunks: Arc<Mutex<BTreeMap<u32, Chunk>>>,
     current_file_id: Arc<AtomicU32>,
     data_directory: PathBuf,
     max_file_size: usize,
@@ -66,7 +65,7 @@ impl Chunks {
             Chunk::new(&db_path, current_file_id, max_file_size)?,
         );
         Ok(Chunks {
-            chunks: RefCell::new(chunks),
+            chunks: Arc::new(Mutex::new(chunks)),
             current_file_id: Arc::new(AtomicU32::new(current_file_id)),
             data_directory: db_path.clone(),
             max_file_size,
@@ -74,7 +73,7 @@ impl Chunks {
     }
 
     pub fn put(&self, key: &Vec<u8>, value: &Vec<u8>) -> Result<ValueDetails, Error> {
-        let mut chunks = self.chunks.borrow_mut();
+        let mut chunks = self.chunks.lock().unwrap();
         let mut current_chunk = chunks.last_key_value().unwrap().1;
 
         if current_chunk.is_full() {
@@ -88,13 +87,13 @@ impl Chunks {
 
     pub fn get(&self, value_details: &ValueDetails) -> Result<Vec<u8>, Error> {
         let file_id = value_details.file_id;
-        let chunks = self.chunks.borrow();
+        let chunks = self.chunks.lock().unwrap();
         let chunk = chunks.get(&file_id).unwrap();
         return chunk.get(value_details);
     }
 
     pub fn delete(&self, key: &Vec<u8>) -> Result<(), Error> {
-        let mut chunks = self.chunks.borrow_mut();
+        let mut chunks = self.chunks.lock().unwrap();
         let mut current_chunk = chunks.last_key_value().unwrap().1;
 
         if current_chunk.is_full() {
@@ -110,13 +109,13 @@ impl Chunks {
         &mut self,
     ) -> Result<HashMap<Vec<u8>, ValueDetails>, Error> {
         let mut index: HashMap<Vec<u8>, ValueDetails> = HashMap::new();
-        for (_, chunk) in self.chunks.borrow_mut().iter_mut() {
+        for (_, chunk) in self.chunks.lock().unwrap().iter_mut() {
             chunk.recreate_index(&mut index)?;
         }
         Ok(index)
     }
 
-    fn deprecate_current_chunk(&self, chunks: &mut RefMut<'_, BTreeMap<u32, Chunk>>) -> Result<(), Error> {
+    fn deprecate_current_chunk(&self, chunks: &mut BTreeMap<u32, Chunk>) -> Result<(), Error> {
         let previous_file_id = self.current_file_id.fetch_add(1, Ordering::SeqCst);
         let new_file_id = previous_file_id + 1;
         let new_chunk = Chunk::new(&self.data_directory, new_file_id, self.max_file_size)?;
